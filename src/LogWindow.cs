@@ -80,6 +80,12 @@ class LogWindow : Form {
             case "pause_pending": category="暂停"; return "请求暂停";
             case "paused": category="暂停"; return "确认暂停";
             case "quota-interrupted":category="暂停";return "额度中断登记";
+            case "manual-held":category="暂停";return "保持手动暂停";
+            case "manual-registered":category="继续";return "登记自动继续";
+            case "manual-command-queued":category="设置";return "项目操作登记";
+            case "manual-start":category="继续";return "手动开始";
+            case "manual-already-active":category="继续";return "已有执行，无重复开始";
+            case "manual-rejected":category="错误";return "项目操作未执行";
             case "interrupt-response": category="暂停"; return "暂停回复";
             case "resume_submitting": category="继续"; return "提交继续";
             case "resumed": category="继续"; return "确认继续";

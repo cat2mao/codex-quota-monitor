@@ -24,6 +24,7 @@ public class MonitorSettings {
     public double nearLimitRemainingPercent = 10;
     public int nearLimitPollSeconds = 10;
     public int maxConsecutiveFailures = 0;
+    public bool showAllProjects = false;
     public string stateDirectory;
 }
 
@@ -102,6 +103,8 @@ class MonitorWindow : Form {
     readonly NumericUpDown poll=new NumericUpDown(), threshold=new NumericUpDown(), resetThreshold=new NumericUpDown(), nearThreshold=new NumericUpDown(), nearPoll=new NumericUpDown();
     readonly CheckBox observe=new CheckBox(), resumeAll=new CheckBox(), autoReset=new CheckBox();
     readonly CheckBox stopOnFailures=new CheckBox();
+    readonly CheckBox showAll=new CheckBox();
+    readonly ContextMenuStrip projectMenu=new ContextMenuStrip();
     readonly NumericUpDown failureLimit=new NumericUpDown();
     readonly DataGridView chats=new DataGridView();
     readonly TextBox log=new TextBox();
@@ -135,7 +138,7 @@ class MonitorWindow : Form {
         if(config.resumeExcludedThreadIds==null) config.resumeExcludedThreadIds=new string[0];
         if (smokeTest) config.observeOnly=true;
         initialConfig=json.Deserialize<MonitorSettings>(json.Serialize(config));
-        Text="Codex 额度监控 · v1.1.1"; Icon=SystemIcons.Application;
+        Text="Codex 额度监控 · v1.2.0"; Icon=Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         ClientSize=new Size(1120,970); MinimumSize=new Size(984,924); StartPosition=FormStartPosition.CenterScreen;
         Font=new Font("Microsoft YaHei UI",9); ForeColor=Color.FromArgb(38,53,73); BackColor=Color.FromArgb(242,246,251); AutoScaleMode=AutoScaleMode.Dpi;
         BuildWindow();
@@ -144,6 +147,7 @@ class MonitorWindow : Form {
         autoReset.Checked=config.autoResetEnabled; resetThreshold.Value=(decimal)Math.Max(0,Math.Min(99,config.resetWeeklyRemainingPercent));
         nearThreshold.Value=(decimal)Math.Max(0,Math.Min(100,config.nearLimitRemainingPercent));nearPoll.Value=Math.Max(1,Math.Min(3600,config.nearLimitPollSeconds));
         stopOnFailures.Checked=config.maxConsecutiveFailures>0;failureLimit.Value=Math.Max(1,Math.Min(9999,config.maxConsecutiveFailures>0 ? config.maxConsecutiveFailures : 5));failureLimit.Enabled=stopOnFailures.Checked;
+        showAll.Checked=config.showAllProjects;
         loading=false;
         WriteSettings();
         var trayMenu=new ContextMenuStrip();
@@ -186,7 +190,7 @@ class MonitorWindow : Form {
     Label Inline(string text) { return new Label {Text=text,AutoSize=true,Margin=new Padding(0,9,8,0)}; }
     void BuildWindow() {
         var root=new TableLayoutPanel {Dock=DockStyle.Fill,Padding=new Padding(24,16,24,12),ColumnCount=1,RowCount=10};
-        foreach(int h in new int[]{66,192,174,94,46,35}) root.RowStyles.Add(new RowStyle(SizeType.Absolute,h));
+        foreach(int h in new int[]{66,192,184,94,46,35}) root.RowStyles.Add(new RowStyle(SizeType.Absolute,h));
         root.RowStyles.Add(new RowStyle(SizeType.Percent,100)); root.RowStyles.Add(new RowStyle(SizeType.Absolute,28));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute,80)); root.RowStyles.Add(new RowStyle(SizeType.Absolute,46));
         var heading=new TableLayoutPanel {Dock=DockStyle.Fill,ColumnCount=2};
@@ -198,7 +202,7 @@ class MonitorWindow : Form {
         cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,50)); cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,50)); week.Margin=new Padding(0);
         cards.Controls.Add(five,0,0); cards.Controls.Add(week,1,0); root.Controls.Add(cards,0,1);
         var settings=new TableLayoutPanel {Dock=DockStyle.Fill,BackColor=Color.White,Padding=new Padding(12,3,10,3),ColumnCount=1,RowCount=4,Margin=new Padding(0,0,0,8)};
-        settings.RowStyles.Add(new RowStyle(SizeType.Absolute,44));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,38));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,38));
+        settings.RowStyles.Add(new RowStyle(SizeType.Absolute,44));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,42));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,44));
         settings.RowStyles.Add(new RowStyle(SizeType.Absolute,38));
         var first=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false,Margin=new Padding(0)};
         poll.Minimum=1; poll.Maximum=3600; poll.Width=75; poll.Margin=new Padding(0,6,10,0);
@@ -219,12 +223,12 @@ class MonitorWindow : Form {
             config.resumeThreadIds=ids.ToArray();config.resumeExcludedThreadIds=excluded.ToArray();SaveAndApply();RenderChats(true);
         } };
         observe.Margin=new Padding(0,7,20,0);
-        second.Controls.Add(observe); second.Controls.Add(resumeAll); second.Controls.Add(Inline("每行可单独修改；仅恢复本监控器暂停的任务。"));
-        var near=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false};
+        second.Controls.Add(observe); second.Controls.Add(resumeAll); second.Controls.Add(Inline("逐行勾选；右键可登记空闲或已结束项目继续。"));
+        var near=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false,Margin=new Padding(0)};
         nearThreshold.Minimum=0;nearThreshold.Maximum=100;nearThreshold.DecimalPlaces=1;nearThreshold.Width=64;nearThreshold.Margin=new Padding(0,6,3,0);
         nearPoll.Minimum=1;nearPoll.Maximum=3600;nearPoll.Width=64;nearPoll.Margin=new Padding(0,6,3,0);
         near.Controls.Add(Inline("五小时剩余 ≤"));near.Controls.Add(nearThreshold);near.Controls.Add(Inline("% 时，每"));near.Controls.Add(nearPoll);near.Controls.Add(Inline("秒查询（暂停确认后恢复常规间隔）"));
-        var failures=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false};
+        var failures=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false,Margin=new Padding(0)};
         stopOnFailures.Text="连续失败后自动停止监控";stopOnFailures.AutoSize=true;stopOnFailures.Margin=new Padding(0,9,12,0);
         failureLimit.Minimum=1;failureLimit.Maximum=9999;failureLimit.Width=72;failureLimit.Margin=new Padding(0,6,3,0);
         stopOnFailures.CheckedChanged+=delegate {failureLimit.Enabled=stopOnFailures.Checked;if(!loading) SaveAndApply();};
@@ -248,7 +252,9 @@ class MonitorWindow : Form {
         toolbar.Controls.Add(MakeButton("全选列表",delegate { SelectChats(true); }));
         toolbar.Controls.Add(MakeButton("清空列表",delegate { SelectChats(false); }));
         toolbar.Controls.Add(MakeButton("查看日志",delegate { OpenLogs(); }));
-        listTitle.AutoSize=true;listTitle.Margin=new Padding(12,10,0,0);toolbar.Controls.Add(listTitle);root.Controls.Add(toolbar,0,4);
+        showAll.Text="显示所有项目";showAll.AutoSize=true;showAll.Margin=new Padding(4,9,8,0);
+        showAll.CheckedChanged+=delegate {if(!loading){WriteSettings();RenderChats(true);}};toolbar.Controls.Add(showAll);
+        listTitle.AutoSize=true;listTitle.Margin=new Padding(4,10,0,0);toolbar.Controls.Add(listTitle);root.Controls.Add(toolbar,0,4);
         counts.Dock=DockStyle.Fill;counts.TextAlign=ContentAlignment.MiddleLeft;counts.Font=new Font(Font,FontStyle.Bold);root.Controls.Add(counts,0,5);
         chats.Dock=DockStyle.Fill; chats.BackgroundColor=Color.White; chats.BorderStyle=BorderStyle.None; chats.AllowUserToAddRows=false; chats.AllowUserToDeleteRows=false;
         chats.RowHeadersVisible=false; chats.AutoSizeRowsMode=DataGridViewAutoSizeRowsMode.None; chats.RowTemplate.Height=34;
@@ -268,6 +274,13 @@ class MonitorWindow : Form {
             if(Convert.ToBoolean(row.Cells[0].Value)){ids.Add(id);excluded.Remove(id);}else{ids.Remove(id);excluded.Add(id);}
             config.resumeThreadIds=ids.ToArray();config.resumeExcludedThreadIds=excluded.ToArray();SaveAndApply();
         };
+        projectMenu.Items.Add("手动暂停（保持暂停）",null,delegate {ProjectAction("Pause");});
+        projectMenu.Items.Add("手动开始 / 继续",null,delegate {ProjectAction("Start");});
+        projectMenu.Items.Add("登记自动继续（空闲 / 已结束也可）",null,delegate {ProjectAction("AutoContinue");});
+        projectMenu.Items.Add("取消自动继续",null,delegate {ProjectAction("CancelAuto");});
+        projectMenu.Opening+=delegate(object sender,System.ComponentModel.CancelEventArgs e){e.Cancel=chats.CurrentRow==null;foreach(ToolStripItem item in projectMenu.Items)item.Enabled=!observe.Checked && !stopRequested;};
+        chats.ContextMenuStrip=projectMenu;
+        chats.CellMouseDown+=delegate(object sender,DataGridViewCellMouseEventArgs e){if(e.Button==MouseButtons.Right && e.RowIndex>=0){chats.ClearSelection();chats.CurrentCell=chats.Rows[e.RowIndex].Cells[1];chats.Rows[e.RowIndex].Selected=true;}};
         root.Controls.Add(chats,0,6);
         freshness.Dock=DockStyle.Fill; freshness.TextAlign=ContentAlignment.MiddleLeft; freshness.ForeColor=Color.FromArgb(77,94,112); root.Controls.Add(freshness,0,7);
         log.Dock=DockStyle.Fill; log.Multiline=true; log.ReadOnly=true; log.ScrollBars=ScrollBars.Vertical; log.BorderStyle=BorderStyle.None; log.BackColor=Color.White; log.Font=new Font("Microsoft YaHei UI",8.5f);
@@ -284,6 +297,7 @@ class MonitorWindow : Form {
         config.autoResetEnabled=autoReset.Checked;config.resetWeeklyRemainingPercent=(double)resetThreshold.Value;
         config.nearLimitRemainingPercent=(double)nearThreshold.Value;config.nearLimitPollSeconds=(int)nearPoll.Value;
         config.maxConsecutiveFailures=stopOnFailures.Checked ? (int)failureLimit.Value : 0;
+        config.showAllProjects=showAll.Checked;
         AtomicJson(settingsPath,config);
     }
     void SaveAndApply() {
@@ -335,6 +349,25 @@ class MonitorWindow : Form {
         if(stopRequested && action!="Stop") return;
         AtomicJson(Path.Combine(stateDir,"control.json"),new {id=Guid.NewGuid().ToString(),action=action,time=DateTime.UtcNow.ToString("o")});
     }
+    void ProjectAction(string action) {
+        if(chats.CurrentRow==null)return;
+        if(observe.Checked){AppendLog("只读观察模式不操作项目，请先取消只读观察。");return;}
+        if(stopRequested){AppendLog("正在停止监控，请稍后再操作。");return;}
+        string id=Str(chats.CurrentRow.Tag),title=Str(chats.CurrentRow.Cells[1].Value);
+        try {
+            if(action=="AutoContinue" || action=="CancelAuto"){
+                chats.CurrentRow.Cells[0].Value=action=="AutoContinue";SaveAndApply();
+            }
+            string directory=Path.Combine(stateDir,"commands");Directory.CreateDirectory(directory);
+            AtomicJson(Path.Combine(directory,DateTime.UtcNow.Ticks.ToString("D20")+"-"+Guid.NewGuid().ToString()+".json"),new {id=Guid.NewGuid().ToString(),threadId=id,title=title,action=action,time=DateTime.UtcNow.ToString("o")});
+            if(!WorkerRunning())StartWorker();else Signal("Refresh");
+            if((action=="Start" || action=="AutoContinue") && Str(chats.CurrentRow.Cells[2].Value)=="未加载"){
+                try {Process.Start(new ProcessStartInfo("codex://threads/"+id){UseShellExecute=true});AppendLog("正在 Codex 客户端打开未加载项目「"+title+"」，加载后执行已登记操作。");}
+                catch(Exception e){AppendLog("操作已登记，请在 Codex 客户端打开项目「"+title+"」；自动打开失败："+e.Message);}
+            }
+            AppendLog("项目「"+title+"」操作已登记；实际暂停、开始和等待原因请看状态和日志。");
+        }catch(Exception e){AppendLog("项目操作登记失败："+e.Message);}
+    }
     void StopWorker() {
         if(!WorkerRunning()) return;
         stopRequested=true; Signal("Stop"); start.Enabled=false; mode.Text="正在停止监控…";
@@ -357,12 +390,13 @@ class MonitorWindow : Form {
             case "needs_attention": return "需要排查";case "completed":return "本轮已结束";case "failed":return "本轮失败，需排查";
             case "cancelled": return "已解除登记"; case "stopped": return "已停止登记";
             case "observing": return "正常监控"; default: return "尚未登记";
+            case "queued":return "已登记，等待继续";case "held":return "保持手动暂停";
         }
     }
     void RenderChats(bool force) {
         if(lastState==null) return;
-        var data=Items(Get(lastState,"chats")).Select(Obj).Where(IsRelevantChat).ToList();
-        string revision=lastChecked+"|"+resumeAll.Checked;
+        var data=Items(Get(lastState,"chats")).Select(Obj).Where(x=>showAll.Checked || IsRelevantChat(x)).ToList();
+        string revision=lastChecked+"|"+resumeAll.Checked+"|"+showAll.Checked+"|"+json.Serialize(data);
         if(!force && revision==lastRendered) return;
         string selected=chats.CurrentRow==null ? "" : Str(chats.CurrentRow.Tag);
         int scroll=chats.FirstDisplayedScrollingRowIndex;
@@ -376,13 +410,13 @@ class MonitorWindow : Form {
             chats.Rows[index].Cells[2].Style.ForeColor=runtime.Contains("执行") ? Color.FromArgb(16,114,107) : Color.FromArgb(109,118,137);
             if(id==selected) chats.CurrentCell=chats.Rows[index].Cells[1];
         }
-        chats.Columns[0].ReadOnly=false;listTitle.Text="当前相关聊天 "+data.Count+" 个";
+        chats.Columns[0].ReadOnly=false;listTitle.Text=(showAll.Checked ? "全部 " : "相关 ")+data.Count+" 个";
         if(scroll>=0 && scroll<chats.Rows.Count) chats.FirstDisplayedScrollingRowIndex=scroll;
         loading=false; lastRendered=revision;
     }
     static bool IsRelevantChat(Dictionary<string,object> chat){
         string runtime=Str(Get(chat,"runtime")),phase=Str(Get(chat,"monitorPhase"));
-        return runtime=="执行中" || runtime=="目标待续" || runtime=="额度中断" || runtime=="等待输入或审批" || new[]{"observing","paused","pause_pending","resume_submitting","needs_attention"}.Contains(phase);
+        return runtime=="执行中" || runtime=="目标待续" || runtime=="额度中断" || runtime=="等待输入或审批" || new[]{"observing","paused","queued","held","pause_pending","resume_submitting","needs_attention"}.Contains(phase) || Str(Get(chat,"waitReason")).Length>0;
     }
     void UpdateScreen() {
         try {
@@ -394,7 +428,7 @@ class MonitorWindow : Form {
                 if(quota.Count>0) { five.UpdateQuota(Get(quota,"remaining"),Get(quota,"resetsAt")); week.UpdateQuota(Get(quota,"weeklyRemaining"),Get(quota,"weeklyResetsAt")); }
                 var c=Obj(Get(data,"counts"));
                 int total=Convert.ToInt32(Get(c,"active")),ordinary=Convert.ToInt32(Get(c,"ordinaryActive")),goals=Convert.ToInt32(Get(c,"goals"));
-                counts.Text="执行中 "+total+"（普通 "+ordinary+"，目标 "+(total-ordinary)+"）    ·    已暂停 "+Str(Get(c,"paused"))+(goals>total-ordinary ? "    ·    目标待续 "+(goals-total+ordinary) : "");
+                counts.Text="执行中 "+total+"（普通 "+ordinary+"，目标 "+(total-ordinary)+"）    ·    已暂停 "+Str(Get(c,"paused"))+"    ·    恢复后待续 "+Convert.ToInt32(Get(c,"autoResumePending"))+(goals>total-ordinary ? "    ·    目标待续 "+(goals-total+ordinary) : "");
                 var credits=Obj(Get(quota,"resetCredits"));var available=Get(credits,"availableCount");
                 var expires=Items(Get(credits,"credits")).Select(Obj).Where(x=>Str(Get(x,"status"))=="available" && Get(x,"expiresAt")!=null).Select(x=>Convert.ToInt64(Get(x,"expiresAt"))).OrderBy(x=>x).ToList();
                 cardInfo.Text="可用卡："+(available==null ? "未提供" : Str(available)+" 张")+(expires.Count>0 ? "   ·   最早到期 "+QuotaCard.FromUnix(expires[0]).ToString("MM-dd HH:mm") : "");
@@ -449,7 +483,7 @@ class MonitorWindow : Form {
         using(var bitmap=new Bitmap(Width,Height)) { DrawToBitmap(bitmap,new Rectangle(Point.Empty,Size)); bitmap.Save(Path.Combine(checkDir,"window-small.png")); }
         try {CheckChoicesAndPreview();}catch(Exception e){SaveCheck(false,"界面交互检查失败："+e.Message);RequestExit();return;}
         passed=passed && choicesPassed && quotaDisplayPassed;
-        SaveCheck(passed,"实时额度、重置时间、查询间隔、失败次数开关及持久化、单聊天选择和只读设置"); RequestExit();
+        SaveCheck(passed,"实时额度、重置时间、失败次数设置、项目筛选及全部列表、右键菜单、单项目选择和只读设置"); RequestExit();
     }
     void CheckChoicesAndPreview(){
         var savedState=lastState;var savedConfig=json.Serialize(config);bool savedDefault=resumeAll.Checked;
@@ -472,6 +506,9 @@ class MonitorWindow : Form {
             var persisted=json.Deserialize<MonitorSettings>(ReadShared(settingsPath));
             if(!persisted.resumeThreadIds.Contains("demo-goal") || persisted.resumeExcludedThreadIds.Contains("demo-goal"))throw new Exception("逐项选择没有保存");
             choicesPassed=true;
+            showAll.Checked=true;RenderChats(true);if(chats.Rows.Count!=5)throw new Exception("显示所有项目遗漏空闲或未加载项目");
+            showAll.Checked=false;RenderChats(true);if(chats.Rows.Count!=3 || projectMenu.Items.Count!=4)throw new Exception("项目筛选或右键菜单错误");
+            if(json.Deserialize<MonitorSettings>(ReadShared(settingsPath)).showAllProjects)throw new Exception("全部列表开关没有保存");
             failureLimit.Value=7;stopOnFailures.Checked=true;SaveAndApply();
             if(json.Deserialize<MonitorSettings>(ReadShared(settingsPath)).maxConsecutiveFailures!=7 || !failureLimit.Enabled)throw new Exception("失败次数设置没有保存");
             stopOnFailures.Checked=false;SaveAndApply();
@@ -483,7 +520,7 @@ class MonitorWindow : Form {
             quotaDisplayPassed=true;
             five.UpdateQuota(65,resetAt);week.UpdateQuota(80,resetAt+6*86400);
             ClientSize=new Size(1120,970);PerformLayout();
-            counts.Text="执行中 2（普通 1，目标 1）    ·    已暂停 1";mode.Text="自动监控 · 暂停阈值 5%";
+            counts.Text="执行中 2（普通 1，目标 1）    ·    已暂停 1    ·    恢复后待续 1";mode.Text="自动监控 · 暂停阈值 5%";
             loading=true;observe.Checked=false;autoReset.Checked=false;poll.Value=180;threshold.Value=5;nearThreshold.Value=10;nearPoll.Value=10;resetThreshold.Value=1;failureLimit.Value=5;loading=false;
             cardInfo.Text="可用卡：2 张   ·   最早到期 01-31 12:00";resetStatus.Text="重置卡：自动使用已关闭；每次只用一张，成功后复查额度。";
             freshness.Text="上次查询 12:00:00   ·   常规 180 秒，低额度 10 秒   ·   示例界面";
@@ -491,10 +528,13 @@ class MonitorWindow : Form {
             using(var bitmap=new Bitmap(Width,Height)){DrawToBitmap(bitmap,new Rectangle(Point.Empty,Size));bitmap.Save(Path.Combine(checkDir,"preview.png"));}
             ClientSize=new Size(960,900);PerformLayout();
             using(var bitmap=new Bitmap(Width,Height)){DrawToBitmap(bitmap,new Rectangle(Point.Empty,Size));bitmap.Save(Path.Combine(checkDir,"preview-small.png"));}
+            projectMenu.Show(chats,new Point(260,30));projectMenu.Refresh();
+            using(var bitmap=new Bitmap(projectMenu.Width,projectMenu.Height)){projectMenu.DrawToBitmap(bitmap,new Rectangle(Point.Empty,projectMenu.Size));bitmap.Save(Path.Combine(checkDir,"project-menu.png"));}projectMenu.Close();
         }finally {
             loading=true;lastState=savedState;config=json.Deserialize<MonitorSettings>(savedConfig);resumeAll.Checked=savedDefault;
             observe.Checked=config.observeOnly;autoReset.Checked=config.autoResetEnabled;poll.Value=config.pollSeconds;threshold.Value=(decimal)config.pauseRemainingPercent;nearThreshold.Value=(decimal)config.nearLimitRemainingPercent;nearPoll.Value=config.nearLimitPollSeconds;resetThreshold.Value=(decimal)config.resetWeeklyRemainingPercent;
             stopOnFailures.Checked=config.maxConsecutiveFailures>0;failureLimit.Value=config.maxConsecutiveFailures>0 ? config.maxConsecutiveFailures : 5;failureLimit.Enabled=stopOnFailures.Checked;
+            showAll.Checked=config.showAllProjects;
             loading=false;WriteSettings();
         }
     }

@@ -80,10 +80,11 @@ function Read-MonitorSettings {
 function Get-MonitorPolicy {
     return [ordered]@{pollSeconds=$PollSeconds;nearLimitPollSeconds=$script:ConfiguredNearLimitPollSeconds;nearLimitRemainingPercent=$script:NearLimitRemainingPercent;maxConsecutiveFailures=$MaxConsecutiveFailures;pauseRemainingPercent=$PauseRemainingPercent;observeOnly=$script:ObserveOnly;resumeAll=$script:ResumeAll;resumeThreadIds=@($script:ResumeThreadIds | Sort-Object);resumeExcludedThreadIds=@($script:ResumeExcludedThreadIds | Sort-Object);autoResetEnabled=$script:AutoResetEnabled;resetWeeklyRemainingPercent=$script:ResetWeeklyRemainingPercent}
 }
-function Get-PollDelay($Quota,$Records) {
+function Get-PollDelay($Quota,$Records,[int]$ActiveCount=-1) {
     $records=@($Records)
     if(@($records|Where-Object phase -in @('pause_pending','resume_submitting')).Count){return [Math]::Min($PollSeconds,$NearLimitPollSeconds)}
-    if(@($records|Where-Object phase -eq 'paused').Count -and !@($records|Where-Object phase -eq 'observing').Count){return $PollSeconds}
+    if($ActiveCount -eq 0){return $PollSeconds}
+    if(@($records|Where-Object phase -in @('paused','queued','held')).Count -and ($ActiveCount -eq 0 -or ($ActiveCount -lt 0 -and !@($records|Where-Object phase -in @('observing','resumed')).Count))){return $PollSeconds}
     return $(if($Quota.remaining -le $script:NearLimitRemainingPercent){[Math]::Min($PollSeconds,$NearLimitPollSeconds)}else{$PollSeconds})
 }
 function Test-FailureLimitReached([int]$Failures) {
@@ -98,10 +99,20 @@ function Get-QuotaStatus($Quota) {
     return '额度可用'
 }
 function Test-AutoResumeAllowed($State) {
+    if($State.manualHold){return $false}
+    if($State.manualStart){return $true}
     return $(if($script:ResumeAll){$State.threadId -notin $script:ResumeExcludedThreadIds}else{$State.threadId -in $script:ResumeThreadIds})
 }
+function Get-AutoResumePendingCount($Records) {
+    if($Mode -eq 'Monitor' -or $script:ObserveOnly){return 0}
+    return @($Records|Where-Object {
+        if($_.pendingCommand){return $_.pendingCommand.action -eq 'Start' -or ($_.pendingCommand.action -eq 'AutoContinue' -and $(if($script:ResumeAll){$_.threadId -notin $script:ResumeExcludedThreadIds}else{$_.threadId -in $script:ResumeThreadIds}))}
+        return $_.phase -in @('paused','queued','pause_pending') -and (Test-AutoResumeAllowed $_)
+    }).Count
+}
 function Get-RecoveryWaitReason($State,$Snapshot,$Quota) {
-    if($State.phase -ne 'paused'){return ''}
+    if($State.phase -notin @('paused','queued','held')){return ''}
+    if($State.manualHold){return '手动暂停；需右键开始或登记自动继续'}
     if(!$Snapshot){return '等待客户端加载聊天'}
     if($Mode -eq 'Monitor' -or $script:ObserveOnly){return '只读观察，不提交继续请求'}
     if(!(Test-AutoResumeAllowed $State)){return '未勾选自动继续'}
@@ -176,7 +187,7 @@ function Get-ChineseEvent($Name,$Details) {
             $c=$Details.counts;$normal=$c.ordinaryActive
             $weekly=$(if($null -eq $Details.weeklyRemaining){'未知'}else{"$($Details.weeklyRemaining)%"})
             $runningGoals=[int]$c.active-[int]$c.ordinaryActive
-            $message="五小时余 $($Details.remaining)% | 周余 $weekly | 执行中 $($c.active)（普通 $normal，目标 $runningGoals） | 已暂停 $($c.paused)"
+            $message="五小时余 $($Details.remaining)% | 周余 $weekly | 执行中 $($c.active)（普通 $normal，目标 $runningGoals） | 已暂停 $($c.paused) | 恢复后待续 $([int]$c.autoResumePending)"
             $status=Get-QuotaStatus @{remaining=$Details.remaining;weeklyRemaining=$Details.weeklyRemaining;allowed=$Details.allowed;spendControlReached=$Details.spendControlReached}
             if($status -eq '额度可用'){$status=$(if($c.paused){'等待恢复'}else{'正常监控'})}
             if($Mode -eq 'Monitor' -or $script:ObserveOnly){$status="只读观察（$status）"}
@@ -188,7 +199,7 @@ function Get-ChineseEvent($Name,$Details) {
         }
         'pause_pending' { if($script:Journal.pausedForGoal){return "正在暂停$label 的目标和当前执行。"};return "正在请求暂停$label；实际暂停结果还需客户端确认。" }
         'interrupt-response' { if($script:Journal.pausedForGoal){return "$label 的目标暂停请求已完成，等待状态确认。"};if($Details.interruptedTurnId){return "客户端已接收$label 的中断请求，正在等待暂停确认。"};return "$label 的轮次已变化，没有中断新的任务。" }
-        'paused' { return "已确认$label 暂停。额度可用并通过两次检查后恢复，无需等待原重置时间。" }
+        'paused' { if($script:Journal.manualHold){return "已确认$label 手动暂停；不会自动继续，可右键开始或登记自动继续。"};return "已确认$label 暂停。额度可用并通过两次检查后恢复，无需等待原重置时间。" }
         'recovery-first-check' { return "$label 已通过第一次恢复检查，至少等待 $RecoveryConfirmSeconds 秒，再次确认额度和任务状态。" }
         'resume_submitting' { return "正在发送$label 的继续请求，请任务先检查已有进度，避免重复操作。" }
         'resume-response' { if($Details.ok){return "客户端已接受$label 的继续请求，正在确认新一轮执行。"};return "$label 的继续请求尚未确认成功，请等待状态核实。" }
@@ -196,6 +207,15 @@ function Get-ChineseEvent($Name,$Details) {
         'completed' { return "$label 的本轮执行已结束，不据此判定整个项目已完成。" }
         'failed' {return "$label 的本轮执行失败，请查看客户端错误；不作为项目完成。"}
         'quota-interrupted' {return "$label 因额度不足中断，已登记等待恢复；勾选自动继续且额度通过检查后继续。"}
+        'manual-registered' {return "$label 已登记自动继续，包含空闲或已结束的任务；额度可用后提交一次继续请求。"}
+        'manual-command-queued' {
+            $action=switch($Details.action){'Pause'{'手动暂停'}'Start'{'手动开始'}'AutoContinue'{'登记自动继续'}'CancelAuto'{'取消自动继续'}}
+            return "项目「$($Details.title)」的$action 请求已保存，等待客户端核实后处理。"
+        }
+        'manual-held' {return "$label 已保持手动暂停，不会自动继续；可右键开始或登记自动继续。"}
+        'manual-start' {return "$label 已收到手动开始请求，检查额度和原任务后执行。"}
+        'manual-already-active' {return "$label 已在执行，本次没有重复提交开始请求。"}
+        'manual-rejected' {return "$label 的操作未执行：$($Details.reason)"}
         'settings-updated' {
             $operation=$(if($Details.observeOnly){'只读观察'}else{'自动监控'})
             $selection=$(if($Details.resumeAll){"默认允许，排除 $($Details.excludedCount) 个"}else{"已选 $($Details.selectedCount) 个聊天"})
@@ -235,6 +255,7 @@ function Write-Event($Name, $Details = @{}) {
     $entry = @{ time = [DateTimeOffset]::UtcNow.ToString('o'); event = $Name; mode = $Mode; threadId = $ThreadId; details = $Details }
     $entry.message=$message
     $entry.chatTitle=$(if($script:Journal.displayTitle){$script:Journal.displayTitle}elseif($ThreadId -eq 'all'){'全部聊天'}else{''})
+    if($Name -eq 'manual-command-queued'){$entry.threadId=$Details.threadId;$entry.chatTitle=$Details.title}
     $entry.settings=Get-MonitorPolicy
     if($script:Journal.lastQuota){
         $q=$script:Journal.lastQuota
@@ -550,7 +571,7 @@ function Test-SameGoal($Goal,$Saved) {
 }
 function Get-GoalDecision($State,$Snapshot,$Quota,[long]$Now) {
     $goal=$Snapshot.threadGoal;$active=Get-ActiveTurn $Snapshot
-    if($State.pausedForGoal -and $State.phase -in @('pause_pending','paused','resume_submitting')) {
+    if($State.pausedForGoal -and $State.phase -in @('pause_pending','paused','queued','resume_submitting')) {
         if(!$goal -or $goal.status -eq 'complete') { return $(if($State.phase -eq 'resume_submitting' -and $Snapshot.latestTurnStartMessageId -eq $State.resumeMessageId){'ResumeConfirmed'}else{'Completed'}) }
         if(!(Test-SameGoal $goal $State.pausedGoal)){return 'UserChanged'}
         if($State.phase -eq 'pause_pending') {
@@ -578,15 +599,15 @@ function Get-Decision($State, $Snapshot, $Quota, [long]$Now) {
     $active = Get-ActiveTurn $Snapshot
     $turns = @(Get-Turns $Snapshot)
     $latest = $(if ($turns.Count) {$turns[-1]} else {$null})
-    if ($State.phase -in @('cancelled','stopped','needs_attention','completed','failed')) { return 'Wait' }
-    if ($State.phase -in @('paused','pause_pending','resume_submitting')) {
+    if ($State.phase -in @('cancelled','stopped','needs_attention','completed','failed','held')) { return 'Wait' }
+    if ($State.phase -in @('paused','queued','pause_pending','resume_submitting')) {
         if ($Snapshot.latestTurnStartMessageId -ne $State.baselineMessageId -and $Snapshot.latestTurnStartMessageId -ne $State.resumeMessageId) { return 'UserChanged' }
         if ($active -and $active.turnId -ne $State.pausedTurnId) {
             if ($State.phase -eq 'resume_submitting' -and $Snapshot.latestTurnStartMessageId -eq $State.resumeMessageId) { return 'ResumeConfirmed' }
             return 'UserChanged'
         }
     }
-    if($State.phase -notin @('paused','resume_submitting') -and (Test-QuotaInterrupted $Snapshot)){return 'QuotaInterrupted'}
+    if($State.phase -notin @('paused','queued','resume_submitting') -and (Test-QuotaInterrupted $Snapshot)){return 'QuotaInterrupted'}
     $goalDecision=Get-GoalDecision $State $Snapshot $Quota $Now
     if($goalDecision){return $goalDecision}
     if ($State.phase -eq 'pause_pending') {
@@ -599,7 +620,7 @@ function Get-Decision($State, $Snapshot, $Quota, [long]$Now) {
         if ($Snapshot.latestTurnStartMessageId -eq $State.resumeMessageId -and $latest.turnId -ne $State.pausedTurnId) { return 'ResumeConfirmed' }
         return 'Wait'
     }
-    if ($State.phase -eq 'paused') {
+    if ($State.phase -in @('paused','queued')) {
         if ($active -or $Snapshot.threadRuntimeStatus.type -eq 'active' -or @($Snapshot.requests).Count) { return 'Wait' }
         if ((Test-AutoResumeAllowed $State) -and $Quota.allowed -and $Quota.remaining -gt $PauseRemainingPercent -and ($null -eq $Quota.weeklyRemaining -or $Quota.weeklyRemaining -gt 0)) { return 'RecoveryReady' }
         return 'Wait'
@@ -687,6 +708,59 @@ function Get-DesktopSnapshots($Owners) {
 function New-ThreadJournal($Id,$Version) {
     return @{threadId=$Id;accountId=$AccountId;mode=$Mode;appVersion=$Version;phase='observing';lastControlId=$null;recoverySeenAt=$null;resumeMessageId=$null}
 }
+function Get-ThreadRuntimeLabel($Snapshot) {
+    if(!$Snapshot){return '未加载'}
+    if(@($Snapshot.requests).Count){return '等待输入或审批'}
+    if(Get-ActiveTurn $Snapshot){return '执行中'}
+    if(Test-QuotaInterrupted $Snapshot){return '额度中断'}
+    if($Snapshot.threadGoal.status -eq 'active'){return '目标待续'}
+    if($Snapshot.threadGoal.status -eq 'paused'){return '目标已暂停'}
+    return '空闲'
+}
+function Read-ThreadCommands($Fleet,$Version) {
+    $directory=Join-Path $script:RunDirectory 'commands'
+    if(!(Test-Path -LiteralPath $directory)){return}
+    foreach($file in @(Get-ChildItem -LiteralPath $directory -Filter '*.json' | Sort-Object Name)) {
+        $command=Read-Json $file.FullName
+        if($command.threadId -notmatch '^[0-9a-fA-F-]{36}$' -or $command.action -notin @('Pause','Start','AutoContinue','CancelAuto')){throw 'Invalid project command.'}
+        if(!$Fleet.threads[$command.threadId]){$Fleet.threads[$command.threadId]=New-ThreadJournal $command.threadId $Version}
+        $record=$Fleet.threads[$command.threadId]
+        if($record.lastManualCommandId -ne $command.id){$record.pendingCommand=$command;Save-Journal;Write-Event 'manual-command-queued' @{threadId=$command.threadId;title=$command.title;action=$command.action}}
+        Save-Journal
+        Remove-Item -LiteralPath $file.FullName
+    }
+}
+function Apply-ThreadCommand($Snapshot) {
+    $record=$script:Journal;$command=$record.pendingCommand
+    if(!$command){return}
+    $active=Get-ActiveTurn $Snapshot
+    $record.pendingCommand=$null;$record.lastManualCommandId=$command.id
+    if($Mode -eq 'Monitor' -or $script:ObserveOnly){Save-Journal;Write-Event 'manual-rejected' @{reason='只读观察模式不操作项目。'};return}
+    if($record.phase -in @('pause_pending','resume_submitting')){Save-Journal;Write-Event 'manual-rejected' @{reason='上一次操作仍待确认，请等待结果后再操作。'};return}
+    if($command.action -eq 'CancelAuto'){
+        $record.manualStart=$false;$record.manualHold=$true
+        if($record.phase -eq 'queued'){$record.phase='held'}
+        Save-Journal;Write-Event 'manual-held';return
+    }
+    if($command.action -eq 'Pause'){
+        $record.manualHold=$true;$record.manualStart=$false
+        if($active -or $Snapshot.threadGoal.status -eq 'active'){$record.phase='observing';$record.forcePause=$true;Save-Journal}
+        else {Set-Phase 'held';Write-Event 'manual-held'}
+        return
+    }
+    $record.manualHold=$false;$record.manualStart=$command.action -eq 'Start'
+    if($active -or $Snapshot.threadRuntimeStatus.type -eq 'active' -or $Snapshot.threadGoal.status -eq 'active'){
+        $record.phase='observing';$record.manualStart=$false;Save-Journal;Write-Event 'manual-already-active';return
+    }
+    $latest=@(Get-Turns $Snapshot) | Select-Object -Last 1
+    $record.pausedTurnId=$latest.turnId;$record.baselineMessageId=$Snapshot.latestTurnStartMessageId
+    $record.resumeMessageId=$null;$record.recoverySeenAt=$null
+    $record.pausedForGoal=$Snapshot.threadGoal.status -in @('paused','usageLimited')
+    $record.pausedSource=$(if($Snapshot.threadGoal.status -eq 'usageLimited'){'quota'}else{'manual'})
+    if($record.pausedForGoal){$g=$Snapshot.threadGoal;$record.pausedGoal=@{objective=$g.objective;createdAt=$g.createdAt;tokenBudget=$g.tokenBudget};$record.pausedGoalUpdatedAt=$g.updatedAt}
+    Set-Phase 'queued';Write-Event $(if($record.manualStart){'manual-start'}else{'manual-registered'})
+    if($record.manualStart){$record.recoverySeenAt=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()-$RecoveryConfirmSeconds*1000;Save-Journal}
+}
 function Start-AllMonitor {
     $rootDirectory=$script:RunDirectory; $script:ThreadId='all'
     $version=Get-DesktopVersion
@@ -712,6 +786,7 @@ function Start-AllMonitor {
         }
         try {
             Read-MonitorSettings
+            Read-ThreadCommands $fleet $version
             Write-Event 'checking-quota'
             $live=Get-QuotaWithAutoReset;$fleet.accountId=$AccountId
             $quota=Get-EffectiveQuota $live
@@ -726,24 +801,22 @@ function Start-AllMonitor {
             foreach($chat in $catalog.chats){
                 $snapshot=$snapshots[$chat.id];$record=$fleet.threads[$chat.id]
                 $title=$(if($snapshot.title){[string]$snapshot.title}else{[string]$chat.title})
-                $status=$(if(!$snapshot){'未加载'}elseif(@($snapshot.requests).Count){'等待输入或审批'}elseif(Get-ActiveTurn $snapshot){'执行中'}elseif(Test-QuotaInterrupted $snapshot){'额度中断'}elseif($snapshot.threadGoal.status -eq 'active'){'目标待续'}elseif($snapshot.threadGoal.status -eq 'paused'){'目标已暂停'}else{'空闲'})
+                $status=Get-ThreadRuntimeLabel $snapshot
                 $fleet.chats+=@{id=$chat.id;title=($title -replace '[\r\n\t]',' ');runtime=$status;goalStatus=$snapshot.threadGoal.status;monitorPhase=$record.phase;waitReason=''}
             }
             $activeCount=0;$ordinaryActiveCount=0;$goalCount=0;$busyCount=0
             foreach($id in @($snapshots.Keys)) {
                 $snapshot=$snapshots[$id];$active=Get-ActiveTurn $snapshot
-                if($active){$activeCount++}
                 $activeGoal=$snapshot.threadGoal.status -eq 'active'
                 $quotaInterrupted=Test-QuotaInterrupted $snapshot
-                if($activeGoal){$goalCount++}elseif($active){$ordinaryActiveCount++}
                 $record=$fleet.threads[$id]
                 if(!$record -and !$active -and !$activeGoal -and !$quotaInterrupted){continue}
-                if(!$record -or (($active -or $activeGoal) -and $record.phase -in @('completed','cancelled','failed')) -or ($quotaInterrupted -and $record.phase -eq 'completed') -or ($record.phase -eq 'needs_attention' -and $record.reason -eq 'active-Goal')) {
+                if(!$record -or (!$record.pendingCommand -and (($active -or $activeGoal) -and $record.phase -in @('completed','cancelled','failed','held'))) -or (!$record.pendingCommand -and $quotaInterrupted -and $record.phase -eq 'completed') -or ($record.phase -eq 'needs_attention' -and $record.reason -eq 'active-Goal')) {
                     $record=New-ThreadJournal $id $version;$fleet.threads[$id]=$record
                 }
                 $record.displayTitle=([string]$snapshot.title -replace '[\r\n\t]',' ').Trim()
                 if($record.displayTitle.Length -gt 80){$record.displayTitle=$record.displayTitle.Substring(0,80)+'…'}
-                if($record.phase -in @('completed','cancelled','stopped','needs_attention','failed')){continue}
+                if(!$record.pendingCommand -and $record.phase -in @('completed','cancelled','stopped','needs_attention','failed','held')){continue}
                 $mutex=[Threading.Mutex]::new($false,('Local\CodexQuotaMonitorV1-'+$id));$owned=$false;$fileLock=$null
                 try {
                     try{$owned=$mutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$owned=$true}
@@ -752,9 +825,11 @@ function Start-AllMonitor {
                     $script:RunDirectory=Join-Path $rootDirectory ('threads\'+$id)
                     [void][IO.Directory]::CreateDirectory($script:RunDirectory)
                     $fileLock=[IO.File]::Open((Join-Path $script:RunDirectory 'run.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
-                    if($record.phase -eq 'paused' -and $record.recoverySeenAt -and ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()-[long]$record.recoverySeenAt -ge $RecoveryConfirmSeconds*1000)) {
+                    Apply-ThreadCommand $snapshot
+                    if($record.phase -in @('paused','queued') -and $record.recoverySeenAt -and ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()-[long]$record.recoverySeenAt -ge $RecoveryConfirmSeconds*1000)) {
                         $live=Get-LiveQuota;$quota=Get-EffectiveQuota $live
                         $snapshot=Get-Snapshot
+                        $snapshots[$id]=$snapshot
                     }
                     $record.lastCheckedAt=[DateTimeOffset]::UtcNow.ToString('o');$record.lastQuota=$quota;$record.lastLiveQuota=$live
                     $decision=Update-ThreadState $snapshot $quota ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
@@ -774,20 +849,28 @@ function Start-AllMonitor {
             $script:RunDirectory=$rootDirectory;$script:Journal=$fleet;$script:ThreadId='all';$script:OwnerId=$null
             # An archived/deleted chat must not be resumed from an old saved pause.
             foreach($id in @($fleet.threads.Keys)) {
-                if($id -notin $catalog.ids -and $fleet.threads[$id].phase -in @('paused','pause_pending','resume_submitting')) {
-                    $fleet.threads[$id].phase='cancelled';Write-Event 'removed-chat' @{id=$id}
+                if($id -notin $catalog.ids -and ($fleet.threads[$id].phase -in @('paused','queued','pause_pending','resume_submitting') -or $fleet.threads[$id].pendingCommand)) {
+                    $fleet.threads[$id].phase='cancelled';$fleet.threads[$id].pendingCommand=$null;Write-Event 'removed-chat' @{id=$id}
                 }
             }
             foreach($chat in $fleet.chats){
                 $record=$fleet.threads[$chat.id];$chat.monitorPhase=$record.phase
-                if($record){$chat.waitReason=Get-RecoveryWaitReason $record $snapshots[$chat.id] $quota}
+                $chat.runtime=Get-ThreadRuntimeLabel $snapshots[$chat.id];$chat.goalStatus=$snapshots[$chat.id].threadGoal.status
+                if($record){$chat.waitReason=$(if($record.pendingCommand){'操作已登记，等待客户端加载该聊天'}else{Get-RecoveryWaitReason $record $snapshots[$chat.id] $quota})}
             }
             $fleet.lastCheckedAt=[DateTimeOffset]::UtcNow.ToString('o')
             $fleet.readFailureCount=0
             $fleet.lastQuota=$quota;$fleet.lastLiveQuota=$live
             $fleet.settings=Get-MonitorPolicy
+            $activeCount=0;$ordinaryActiveCount=0;$goalCount=0
+            foreach($current in $snapshots.Values){
+                $isActive=[bool](Get-ActiveTurn $current)
+                if($isActive){$activeCount++}
+                if($current.threadGoal.status -eq 'active'){$goalCount++}elseif($isActive){$ordinaryActiveCount++}
+            }
             $fleet.counts=@{catalog=$catalog.total;desktopCatalog=$catalog.ids.Count;loaded=$snapshots.Count;active=$activeCount;ordinaryActive=$ordinaryActiveCount;goals=$goalCount;goalSkipped=0;otherMonitor=$busyCount;paused=@($fleet.threads.Values|Where-Object phase -eq 'paused').Count;needsAttention=@($fleet.threads.Values|Where-Object phase -eq 'needs_attention').Count}
-            $fleet.nextPollSeconds=Get-PollDelay $quota $fleet.threads.Values
+            $fleet.counts.autoResumePending=Get-AutoResumePendingCount $fleet.threads.Values
+            $fleet.nextPollSeconds=Get-PollDelay $quota $fleet.threads.Values ($activeCount+$goalCount)
             Save-Journal;Write-Event 'all-monitor' @{remaining=$quota.remaining;weeklyRemaining=$quota.weeklyRemaining;allowed=$quota.allowed;spendControlReached=$quota.spendControlReached;counts=$fleet.counts}
             Close-Ipc;$failures=0
             if($Once){Write-Event 'single-check-finished';break}
@@ -819,6 +902,7 @@ function Wait-Poll([int]$Seconds) {
             if($All -and $script:Journal.scope -eq 'all'){foreach($record in $script:Journal.threads.Values){$record.phase='cancelled'}}
             Set-Phase 'cancelled'; return $false
         }
+        if($All -and @((Get-ChildItem -LiteralPath (Join-Path $script:RunDirectory 'commands') -Filter '*.json' -ErrorAction SilentlyContinue)).Count){return $true}
         Start-Sleep -Milliseconds 250
     }
     return $true
@@ -826,6 +910,7 @@ function Wait-Poll([int]$Seconds) {
 function Update-ThreadState($snapshot, $quota, [long]$now) {
     Read-MonitorSettings
     $decision=Get-Decision $script:Journal $snapshot $quota $now
+    if($script:Journal.forcePause){$decision='Pause';$script:Journal.forcePause=$false}
     Save-Journal
     if ($Mode -eq 'Monitor' -or $script:ObserveOnly) {
         Write-Event 'monitor' @{remaining=$quota.remaining;weeklyRemaining=$quota.weeklyRemaining;runtime=$snapshot.threadRuntimeStatus.type;wouldDo=$decision}
@@ -877,12 +962,14 @@ function Update-ThreadState($snapshot, $quota, [long]$now) {
                         $goalReply=Invoke-QuotaRpc 'thread/goal/set' @{threadId=$ThreadId;status='active'}
                         if(!(Test-SameGoal $goalReply.goal $script:Journal.pausedGoal) -or $goalReply.goal.status -ne 'active'){throw 'goal-resume-not-confirmed'}
                     }
-                    $request=@{threadId=$ThreadId;input=@(@{type='text';text='额度已恢复。请先检查当前进度和已完成的操作，从中断处继续原任务；已完成的步骤不要重复执行。';text_elements=@()});clientUserMessageId=$script:Journal.resumeMessageId}
+                    $continueText=$(if($script:Journal.pausedSource -eq 'manual'){'用户已主动请求继续此项目。请先检查当前进度，继续原任务中尚未完成的工作，已完成的步骤不要重复执行；若全部完成，请报告完成情况。'}else{'额度已恢复。请先检查当前进度和已完成的操作，从中断处继续原任务；已完成的步骤不要重复执行。'})
+                    $request=@{threadId=$ThreadId;input=@(@{type='text';text=$continueText;text_elements=@()});clientUserMessageId=$script:Journal.resumeMessageId}
                     $reply=Invoke-Ipc 'thread-follower-start-turn' @{conversationId=$ThreadId;turnStart=@{request=$request;context=@{inheritThreadSettings=$true}}} 2 30 $script:OwnerId
                     Write-Event 'resume-response' @{ok=($reply.resultType -eq 'success')}
                 }
             }
             'ResumeConfirmed' {
+                $script:Journal.manualStart=$false
                 if($script:Journal.pausedForGoal){
                     $currentGoal=(Invoke-QuotaRpc 'thread/goal/get' @{threadId=$ThreadId}).goal
                     if($currentGoal -and $currentGoal.status -notin @('active','complete')){Set-Phase 'needs_attention' @{reason='goal-resume-not-confirmed'};return 'Wait'}
@@ -893,7 +980,7 @@ function Update-ThreadState($snapshot, $quota, [long]$now) {
             'Completed' { Set-Phase 'completed' }
             'Failed' {Set-Phase 'failed' @{reason='non-quota-turn-failure'}}
             'Wait' {
-                if ($script:Journal.phase -eq 'paused' -and $script:Journal.recoverySeenAt) { $script:Journal.recoverySeenAt=$null; Save-Journal }
+                if ($script:Journal.phase -in @('paused','queued') -and $script:Journal.recoverySeenAt) { $script:Journal.recoverySeenAt=$null; Save-Journal }
                 if ($script:Journal.phase -eq 'resume_submitting' -and $now - [DateTimeOffset]::Parse($script:Journal.resumeSubmittedAt).ToUnixTimeSeconds() -gt 60) { Set-Phase 'needs_attention' @{reason='resume-outcome-unknown-no-resend'} }
                 if ($script:Journal.phase -eq 'pause_pending' -and $now - [DateTimeOffset]::Parse($script:Journal.pausedAt).ToUnixTimeSeconds() -gt 60) { Set-Phase 'needs_attention' @{reason='pause-not-confirmed'} }
             }
@@ -934,7 +1021,7 @@ function Start-Monitor {
             $failures=0
             if($Once){Write-Event 'single-check-finished';break}
             if ($script:Journal.phase -in @('completed','failed','cancelled','stopped','needs_attention')) { break }
-            $delay=Get-PollDelay $quota @($script:Journal)
+            $delay=Get-PollDelay $quota @($script:Journal) ([int][bool]((Get-ActiveTurn $snapshot) -or $snapshot.threadGoal.status -eq 'active'))
         } catch {
             $failures++
             Write-Event 'connection-or-read-error' @{error=$_.Exception.Message;failures=$failures}
