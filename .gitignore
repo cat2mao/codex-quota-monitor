@@ -1,0 +1,11 @@
+/dist/
+/work/
+*.exe
+*.pdb
+*.jsonl
+settings.json
+state.json
+control.json
+*.gui.tmp
+*.tmp
+
