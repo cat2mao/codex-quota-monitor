@@ -23,6 +23,7 @@ public class MonitorSettings {
     public double resetWeeklyRemainingPercent = 1;
     public double nearLimitRemainingPercent = 10;
     public int nearLimitPollSeconds = 10;
+    public int maxConsecutiveFailures = 0;
     public string stateDirectory;
 }
 
@@ -100,6 +101,8 @@ class MonitorWindow : Form {
     readonly Label mode=new Label(), freshness=new Label(), counts=new Label(), cardInfo=new Label(), resetStatus=new Label(), listTitle=new Label();
     readonly NumericUpDown poll=new NumericUpDown(), threshold=new NumericUpDown(), resetThreshold=new NumericUpDown(), nearThreshold=new NumericUpDown(), nearPoll=new NumericUpDown();
     readonly CheckBox observe=new CheckBox(), resumeAll=new CheckBox(), autoReset=new CheckBox();
+    readonly CheckBox stopOnFailures=new CheckBox();
+    readonly NumericUpDown failureLimit=new NumericUpDown();
     readonly DataGridView chats=new DataGridView();
     readonly TextBox log=new TextBox();
     readonly Button start=new Button(), apply=new Button(), refresh=new Button();
@@ -132,7 +135,7 @@ class MonitorWindow : Form {
         if(config.resumeExcludedThreadIds==null) config.resumeExcludedThreadIds=new string[0];
         if (smokeTest) config.observeOnly=true;
         initialConfig=json.Deserialize<MonitorSettings>(json.Serialize(config));
-        Text="Codex 额度监控 · v1.1.0"; Icon=SystemIcons.Application;
+        Text="Codex 额度监控 · v1.1.1"; Icon=SystemIcons.Application;
         ClientSize=new Size(1120,970); MinimumSize=new Size(984,924); StartPosition=FormStartPosition.CenterScreen;
         Font=new Font("Microsoft YaHei UI",9); ForeColor=Color.FromArgb(38,53,73); BackColor=Color.FromArgb(242,246,251); AutoScaleMode=AutoScaleMode.Dpi;
         BuildWindow();
@@ -140,6 +143,7 @@ class MonitorWindow : Form {
         observe.Checked=config.observeOnly; resumeAll.Checked=config.resumeAll;
         autoReset.Checked=config.autoResetEnabled; resetThreshold.Value=(decimal)Math.Max(0,Math.Min(99,config.resetWeeklyRemainingPercent));
         nearThreshold.Value=(decimal)Math.Max(0,Math.Min(100,config.nearLimitRemainingPercent));nearPoll.Value=Math.Max(1,Math.Min(3600,config.nearLimitPollSeconds));
+        stopOnFailures.Checked=config.maxConsecutiveFailures>0;failureLimit.Value=Math.Max(1,Math.Min(9999,config.maxConsecutiveFailures>0 ? config.maxConsecutiveFailures : 5));failureLimit.Enabled=stopOnFailures.Checked;
         loading=false;
         WriteSettings();
         var trayMenu=new ContextMenuStrip();
@@ -182,7 +186,7 @@ class MonitorWindow : Form {
     Label Inline(string text) { return new Label {Text=text,AutoSize=true,Margin=new Padding(0,9,8,0)}; }
     void BuildWindow() {
         var root=new TableLayoutPanel {Dock=DockStyle.Fill,Padding=new Padding(24,16,24,12),ColumnCount=1,RowCount=10};
-        foreach(int h in new int[]{66,192,132,94,46,35}) root.RowStyles.Add(new RowStyle(SizeType.Absolute,h));
+        foreach(int h in new int[]{66,192,174,94,46,35}) root.RowStyles.Add(new RowStyle(SizeType.Absolute,h));
         root.RowStyles.Add(new RowStyle(SizeType.Percent,100)); root.RowStyles.Add(new RowStyle(SizeType.Absolute,28));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute,80)); root.RowStyles.Add(new RowStyle(SizeType.Absolute,46));
         var heading=new TableLayoutPanel {Dock=DockStyle.Fill,ColumnCount=2};
@@ -193,8 +197,9 @@ class MonitorWindow : Form {
         var cards=new TableLayoutPanel {Dock=DockStyle.Fill,ColumnCount=2,Margin=new Padding(0,0,0,10)};
         cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,50)); cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,50)); week.Margin=new Padding(0);
         cards.Controls.Add(five,0,0); cards.Controls.Add(week,1,0); root.Controls.Add(cards,0,1);
-        var settings=new TableLayoutPanel {Dock=DockStyle.Fill,BackColor=Color.White,Padding=new Padding(12,3,10,3),ColumnCount=1,RowCount=3,Margin=new Padding(0,0,0,8)};
-        settings.RowStyles.Add(new RowStyle(SizeType.Absolute,44));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,38));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,34));
+        var settings=new TableLayoutPanel {Dock=DockStyle.Fill,BackColor=Color.White,Padding=new Padding(12,3,10,3),ColumnCount=1,RowCount=4,Margin=new Padding(0,0,0,8)};
+        settings.RowStyles.Add(new RowStyle(SizeType.Absolute,44));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,38));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,38));
+        settings.RowStyles.Add(new RowStyle(SizeType.Absolute,38));
         var first=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false,Margin=new Padding(0)};
         poll.Minimum=1; poll.Maximum=3600; poll.Width=75; poll.Margin=new Padding(0,6,10,0);
         threshold.Minimum=0; threshold.Maximum=99; threshold.DecimalPlaces=1; threshold.Width=75; threshold.Margin=new Padding(0,6,0,0);
@@ -202,7 +207,7 @@ class MonitorWindow : Form {
         apply.Text="保存并应用"; apply.AutoSize=false;apply.Size=new Size(140,36);apply.Margin=new Padding(18,3,5,0);apply.Click+=delegate { SaveAndApply(); };
         observe.Text="只读观察"; observe.AutoSize=true; observe.Margin=new Padding(15,9,0,0); observe.CheckedChanged+=delegate { if(!loading) SaveAndApply(); };
         first.Controls.Add(apply);
-        var second=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false};
+        var second=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false,Margin=new Padding(0)};
         resumeAll.Text="新聊天默认允许继续"; resumeAll.AutoSize=true; resumeAll.Margin=new Padding(0,7,15,0);
         resumeAll.CheckedChanged+=delegate { if(!loading){
             // Keep explicit choices for known chats when changing the default for new chats.
@@ -218,8 +223,14 @@ class MonitorWindow : Form {
         var near=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false};
         nearThreshold.Minimum=0;nearThreshold.Maximum=100;nearThreshold.DecimalPlaces=1;nearThreshold.Width=64;nearThreshold.Margin=new Padding(0,6,3,0);
         nearPoll.Minimum=1;nearPoll.Maximum=3600;nearPoll.Width=64;nearPoll.Margin=new Padding(0,6,3,0);
-        near.Controls.Add(Inline("五小时剩余 ≤"));near.Controls.Add(nearThreshold);near.Controls.Add(Inline("% 时，每"));near.Controls.Add(nearPoll);near.Controls.Add(Inline("秒查询（取更短间隔；等待恢复时也加快）"));
+        near.Controls.Add(Inline("五小时剩余 ≤"));near.Controls.Add(nearThreshold);near.Controls.Add(Inline("% 时，每"));near.Controls.Add(nearPoll);near.Controls.Add(Inline("秒查询（暂停确认后恢复常规间隔）"));
+        var failures=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false};
+        stopOnFailures.Text="连续失败后自动停止监控";stopOnFailures.AutoSize=true;stopOnFailures.Margin=new Padding(0,9,12,0);
+        failureLimit.Minimum=1;failureLimit.Maximum=9999;failureLimit.Width=72;failureLimit.Margin=new Padding(0,6,3,0);
+        stopOnFailures.CheckedChanged+=delegate {failureLimit.Enabled=stopOnFailures.Checked;if(!loading) SaveAndApply();};
+        failures.Controls.Add(stopOnFailures);failures.Controls.Add(Inline("连续失败"));failures.Controls.Add(failureLimit);failures.Controls.Add(Inline("次时停止；不勾选则持续重试（默认）"));
         settings.Controls.Add(first,0,0);settings.Controls.Add(near,0,1);settings.Controls.Add(second,0,2);root.Controls.Add(settings,0,2);
+        settings.Controls.Add(failures,0,3);
         var resets=new TableLayoutPanel {Dock=DockStyle.Fill,BackColor=Color.White,Padding=new Padding(12,3,10,3),RowCount=2,ColumnCount=1,Margin=new Padding(0,0,0,10)};
         resets.RowStyles.Add(new RowStyle(SizeType.Absolute,39));resets.RowStyles.Add(new RowStyle(SizeType.Absolute,32));
         var resetFirst=new FlowLayoutPanel {Dock=DockStyle.Fill,WrapContents=false};
@@ -272,6 +283,7 @@ class MonitorWindow : Form {
         config.observeOnly=observe.Checked; config.resumeAll=resumeAll.Checked;
         config.autoResetEnabled=autoReset.Checked;config.resetWeeklyRemainingPercent=(double)resetThreshold.Value;
         config.nearLimitRemainingPercent=(double)nearThreshold.Value;config.nearLimitPollSeconds=(int)nearPoll.Value;
+        config.maxConsecutiveFailures=stopOnFailures.Checked ? (int)failureLimit.Value : 0;
         AtomicJson(settingsPath,config);
     }
     void SaveAndApply() {
@@ -395,7 +407,7 @@ class MonitorWindow : Form {
                     freshness.Text="上次查询 "+checkedTime.ToLocalTime().ToString("HH:mm:ss")+"   ·   "+(age>delay+20 ? "数据已过期，正在等待客户端" : "距下次查询约 "+Math.Max(0,delay-(int)age)+" 秒")+"   ·   客户端 "+Str(Get(data,"appVersion"));
                     freshness.ForeColor=age>delay+20 ? Color.FromArgb(185,61,41) : Color.FromArgb(77,94,112);
                 }
-                if(WorkerRunning() && !stopRequested) mode.Text=Str(Get(data,"phase"))=="needs_attention" ? "需要排查，请看下方日志" : (config.observeOnly ? "只读观察 · 不操作聊天" : "自动监控 · 阈值 "+config.pauseRemainingPercent.ToString("0.#")+"%");
+                if(WorkerRunning() && !stopRequested) mode.Text=Str(Get(data,"phase"))=="needs_attention" ? "需要排查，请看下方日志" : (Convert.ToInt32(Get(data,"readFailureCount"))>0 ? "查询连续失败 "+Str(Get(data,"readFailureCount"))+" 次，正在重试" : (config.observeOnly ? "只读观察 · 不操作聊天" : "自动监控 · 阈值 "+config.pauseRemainingPercent.ToString("0.#")+"%"));
             }
         } catch(IOException) { } catch(Exception e) { mode.Text="状态读取失败："+e.Message; }
         five.Tick(); week.Tick();
@@ -437,7 +449,7 @@ class MonitorWindow : Form {
         using(var bitmap=new Bitmap(Width,Height)) { DrawToBitmap(bitmap,new Rectangle(Point.Empty,Size)); bitmap.Save(Path.Combine(checkDir,"window-small.png")); }
         try {CheckChoicesAndPreview();}catch(Exception e){SaveCheck(false,"界面交互检查失败："+e.Message);RequestExit();return;}
         passed=passed && choicesPassed && quotaDisplayPassed;
-        SaveCheck(passed,"实时额度、两个重置时间、查询间隔、阈值、单聊天选择和只读设置"); RequestExit();
+        SaveCheck(passed,"实时额度、重置时间、查询间隔、失败次数开关及持久化、单聊天选择和只读设置"); RequestExit();
     }
     void CheckChoicesAndPreview(){
         var savedState=lastState;var savedConfig=json.Serialize(config);bool savedDefault=resumeAll.Checked;
@@ -460,6 +472,10 @@ class MonitorWindow : Form {
             var persisted=json.Deserialize<MonitorSettings>(ReadShared(settingsPath));
             if(!persisted.resumeThreadIds.Contains("demo-goal") || persisted.resumeExcludedThreadIds.Contains("demo-goal"))throw new Exception("逐项选择没有保存");
             choicesPassed=true;
+            failureLimit.Value=7;stopOnFailures.Checked=true;SaveAndApply();
+            if(json.Deserialize<MonitorSettings>(ReadShared(settingsPath)).maxConsecutiveFailures!=7 || !failureLimit.Enabled)throw new Exception("失败次数设置没有保存");
+            stopOnFailures.Checked=false;SaveAndApply();
+            if(json.Deserialize<MonitorSettings>(ReadShared(settingsPath)).maxConsecutiveFailures!=0 || failureLimit.Enabled)throw new Exception("无法关闭连续失败自动停止");
             long resetAt=(long)(DateTime.UtcNow.AddHours(2)-new DateTime(1970,1,1)).TotalSeconds;
             five.UpdateQuota(65,resetAt);if(five.Value.Text!="剩余 65%")throw new Exception("额度 65% 未显示");
             five.UpdateQuota(7,resetAt);if(five.Value.Text!="剩余 7%" || five.Bar.Value!=7 || five.Detail.Text!="已用 93%")throw new Exception("额度变化未刷新");
@@ -468,7 +484,7 @@ class MonitorWindow : Form {
             five.UpdateQuota(65,resetAt);week.UpdateQuota(80,resetAt+6*86400);
             ClientSize=new Size(1120,970);PerformLayout();
             counts.Text="执行中 2（普通 1，目标 1）    ·    已暂停 1";mode.Text="自动监控 · 暂停阈值 5%";
-            loading=true;observe.Checked=false;autoReset.Checked=false;poll.Value=180;threshold.Value=5;nearThreshold.Value=10;nearPoll.Value=10;resetThreshold.Value=1;loading=false;
+            loading=true;observe.Checked=false;autoReset.Checked=false;poll.Value=180;threshold.Value=5;nearThreshold.Value=10;nearPoll.Value=10;resetThreshold.Value=1;failureLimit.Value=5;loading=false;
             cardInfo.Text="可用卡：2 张   ·   最早到期 01-31 12:00";resetStatus.Text="重置卡：自动使用已关闭；每次只用一张，成功后复查额度。";
             freshness.Text="上次查询 12:00:00   ·   常规 180 秒，低额度 10 秒   ·   示例界面";
             log.Text="[12:00:00] 五小时余 65% | 周余 80% | 执行中 2（普通 1，目标 1） | 已暂停 1\r\n[11:59:30] 聊天「生成研究报告」因额度不足中断，等待额度恢复。";
@@ -478,6 +494,7 @@ class MonitorWindow : Form {
         }finally {
             loading=true;lastState=savedState;config=json.Deserialize<MonitorSettings>(savedConfig);resumeAll.Checked=savedDefault;
             observe.Checked=config.observeOnly;autoReset.Checked=config.autoResetEnabled;poll.Value=config.pollSeconds;threshold.Value=(decimal)config.pauseRemainingPercent;nearThreshold.Value=(decimal)config.nearLimitRemainingPercent;nearPoll.Value=config.nearLimitPollSeconds;resetThreshold.Value=(decimal)config.resetWeeklyRemainingPercent;
+            stopOnFailures.Checked=config.maxConsecutiveFailures>0;failureLimit.Value=config.maxConsecutiveFailures>0 ? config.maxConsecutiveFailures : 5;failureLimit.Enabled=stopOnFailures.Checked;
             loading=false;WriteSettings();
         }
     }

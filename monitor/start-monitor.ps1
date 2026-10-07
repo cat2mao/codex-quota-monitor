@@ -8,6 +8,7 @@ param(
     [string]$StateDirectory,
     [string]$TestQuotaFile,
     [int]$PollSeconds=30,
+    [ValidateRange(0,9999)][int]$MaxConsecutiveFailures=0,
     [ValidateRange(0,99)][double]$PauseRemainingPercent=5,
     [string]$SettingsPath,
     [switch]$Once,

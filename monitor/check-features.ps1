@@ -9,7 +9,30 @@ function Assert($ok,$name){if(!$ok){throw "FAIL $name"};$script:Checks++;Write-H
 $script:PollSeconds=180;$script:NearLimitPollSeconds=10;$script:NearLimitRemainingPercent=10
 Assert ((Get-PollDelay @{remaining=11} @()) -eq 180) 'normal quota uses normal interval'
 Assert ((Get-PollDelay @{remaining=10} @()) -eq 10) '10 percent triggers faster checks'
-Assert ((Get-PollDelay @{remaining=99} @(@{phase='paused'})) -eq 10) 'recovery wait uses faster checks'
+Assert ((Get-PollDelay @{remaining=99} @(@{phase='paused'})) -eq 180) 'confirmed pause uses normal interval after quota recovery'
+Assert ((Get-PollDelay @{remaining=4} @(@{phase='paused'},@{phase='completed'})) -eq 180) 'confirmed pause uses normal interval even with low quota and terminal history'
+Assert ((Get-PollDelay @{remaining=4} @(@{phase='paused'},@{phase='observing'})) -eq 10) 'remaining monitored work still gets low quota checks'
+Assert ((Get-PollDelay @{remaining=99} @(@{phase='pause_pending'})) -eq 10) 'pending pause confirmation still gets fast checks'
+Assert ((Get-PollDelay @{remaining=99} @(@{phase='resume_submitting'})) -eq 10) 'pending continuation confirmation still gets fast checks'
+$script:MaxConsecutiveFailures=0
+Assert (!(Test-FailureLimitReached 1000)) 'default never stops just because repeated reads fail'
+$script:MaxConsecutiveFailures=3
+Assert (!(Test-FailureLimitReached 2)) 'custom failure limit allows retries below threshold'
+Assert (Test-FailureLimitReached 3) 'custom failure limit stops at exact threshold'
+$script:SettingsPath=Join-Path $script:RunDirectory 'settings.json'
+Write-JsonAtomic $SettingsPath @{pollSeconds=180;pauseRemainingPercent=5;nearLimitPollSeconds=10}
+Read-MonitorSettings
+Assert ($script:MaxConsecutiveFailures -eq 0) 'legacy settings migrate to unlimited retries'
+Write-JsonAtomic $SettingsPath @{pollSeconds=180;pauseRemainingPercent=5;nearLimitPollSeconds=10;maxConsecutiveFailures=7}
+Read-MonitorSettings
+Assert ($script:MaxConsecutiveFailures -eq 7 -and (Get-MonitorPolicy).maxConsecutiveFailures -eq 7) 'live settings and event policy include custom failure limit'
+$badSettings=$false
+Write-JsonAtomic $SettingsPath @{pollSeconds=180;pauseRemainingPercent=5;maxConsecutiveFailures=-1}
+try {Read-MonitorSettings}catch{$badSettings=$true}
+Assert $badSettings 'invalid negative failure limit rejected'
+$script:SettingsPath=$null;$script:MaxConsecutiveFailures=0
+$message=Get-ChineseEvent 'all-read-error' @{failures=6;error='temporary timeout'}
+Assert ($message -match '持续重试' -and $message -notmatch '上限 5') 'default retry log no longer claims a fixed five failure cap'
 $script:PollSeconds=3
 Assert ((Get-PollDelay @{remaining=0} @()) -eq 3) 'near-limit interval never slows a faster normal interval'
 Assert ((Get-QuotaStatus @{remaining=0;weeklyRemaining=84;allowed=$false}) -eq '五小时额度耗尽') 'zero five-hour quota is not mislabeled as bad account'

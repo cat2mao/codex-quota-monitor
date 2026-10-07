@@ -10,6 +10,7 @@ param(
     [int]$PollSeconds = 30,
     [int]$NearLimitPollSeconds = 5,
     [int]$RecoveryConfirmSeconds = 5,
+    [ValidateRange(0,9999)][int]$MaxConsecutiveFailures = 0,
     [ValidateRange(0,99)][double]$PauseRemainingPercent = 5,
     [string]$SettingsPath,
     [switch]$Once,
@@ -60,11 +61,13 @@ function Read-MonitorSettings {
     if($null -ne $settings.resetWeeklyRemainingPercent -and ($settings.resetWeeklyRemainingPercent -lt 0 -or $settings.resetWeeklyRemainingPercent -gt 99)){throw 'Invalid monitor settings.'}
     if($null -ne $settings.nearLimitRemainingPercent -and ($settings.nearLimitRemainingPercent -lt 0 -or $settings.nearLimitRemainingPercent -gt 100)){throw 'Invalid monitor settings.'}
     if($null -ne $settings.nearLimitPollSeconds -and ($settings.nearLimitPollSeconds -lt 1 -or $settings.nearLimitPollSeconds -gt 3600)){throw 'Invalid monitor settings.'}
+    if($null -ne $settings.maxConsecutiveFailures -and ($settings.maxConsecutiveFailures -lt 0 -or $settings.maxConsecutiveFailures -gt 9999 -or $settings.maxConsecutiveFailures -ne [int]$settings.maxConsecutiveFailures)){throw 'Invalid monitor settings.'}
     $previous=Get-MonitorPolicy | ConvertTo-Json -Compress
     $script:PollSeconds=[int]$settings.pollSeconds
     $script:ConfiguredNearLimitPollSeconds=$(if($null -ne $settings.nearLimitPollSeconds){[int]$settings.nearLimitPollSeconds}else{$script:PollSeconds})
     $script:NearLimitPollSeconds=[Math]::Min($script:PollSeconds,$script:ConfiguredNearLimitPollSeconds)
     $script:NearLimitRemainingPercent=$(if($null -ne $settings.nearLimitRemainingPercent){[double]$settings.nearLimitRemainingPercent}else{10.0})
+    $script:MaxConsecutiveFailures=$(if($null -ne $settings.maxConsecutiveFailures){[int]$settings.maxConsecutiveFailures}else{0})
     $script:PauseRemainingPercent=[double]$settings.pauseRemainingPercent
     $script:ObserveOnly=$settings.observeOnly -eq $true
     $script:ResumeAll=$settings.resumeAll -eq $true
@@ -75,10 +78,16 @@ function Read-MonitorSettings {
     if($previous -ne (Get-MonitorPolicy | ConvertTo-Json -Compress) -and $script:Journal){Write-Event 'settings-updated' @{pollSeconds=$PollSeconds;pauseRemainingPercent=$PauseRemainingPercent;observeOnly=$script:ObserveOnly;resumeAll=$script:ResumeAll;selectedCount=$script:ResumeThreadIds.Count;excludedCount=$script:ResumeExcludedThreadIds.Count;autoResetEnabled=$script:AutoResetEnabled;resetWeeklyRemainingPercent=$script:ResetWeeklyRemainingPercent}}
 }
 function Get-MonitorPolicy {
-    return [ordered]@{pollSeconds=$PollSeconds;nearLimitPollSeconds=$script:ConfiguredNearLimitPollSeconds;nearLimitRemainingPercent=$script:NearLimitRemainingPercent;pauseRemainingPercent=$PauseRemainingPercent;observeOnly=$script:ObserveOnly;resumeAll=$script:ResumeAll;resumeThreadIds=@($script:ResumeThreadIds | Sort-Object);resumeExcludedThreadIds=@($script:ResumeExcludedThreadIds | Sort-Object);autoResetEnabled=$script:AutoResetEnabled;resetWeeklyRemainingPercent=$script:ResetWeeklyRemainingPercent}
+    return [ordered]@{pollSeconds=$PollSeconds;nearLimitPollSeconds=$script:ConfiguredNearLimitPollSeconds;nearLimitRemainingPercent=$script:NearLimitRemainingPercent;maxConsecutiveFailures=$MaxConsecutiveFailures;pauseRemainingPercent=$PauseRemainingPercent;observeOnly=$script:ObserveOnly;resumeAll=$script:ResumeAll;resumeThreadIds=@($script:ResumeThreadIds | Sort-Object);resumeExcludedThreadIds=@($script:ResumeExcludedThreadIds | Sort-Object);autoResetEnabled=$script:AutoResetEnabled;resetWeeklyRemainingPercent=$script:ResetWeeklyRemainingPercent}
 }
 function Get-PollDelay($Quota,$Records) {
-    return $(if($Quota.remaining -le $script:NearLimitRemainingPercent -or @($Records|Where-Object phase -in @('paused','pause_pending','resume_submitting')).Count){[Math]::Min($PollSeconds,$NearLimitPollSeconds)}else{$PollSeconds})
+    $records=@($Records)
+    if(@($records|Where-Object phase -in @('pause_pending','resume_submitting')).Count){return [Math]::Min($PollSeconds,$NearLimitPollSeconds)}
+    if(@($records|Where-Object phase -eq 'paused').Count -and !@($records|Where-Object phase -eq 'observing').Count){return $PollSeconds}
+    return $(if($Quota.remaining -le $script:NearLimitRemainingPercent){[Math]::Min($PollSeconds,$NearLimitPollSeconds)}else{$PollSeconds})
+}
+function Test-FailureLimitReached([int]$Failures) {
+    return $MaxConsecutiveFailures -gt 0 -and $Failures -ge $MaxConsecutiveFailures
 }
 function Get-QuotaStatus($Quota) {
     if($null -ne $Quota.weeklyRemaining -and $Quota.weeklyRemaining -le 0){return '周额度耗尽'}
@@ -191,7 +200,8 @@ function Get-ChineseEvent($Name,$Details) {
             $operation=$(if($Details.observeOnly){'只读观察'}else{'自动监控'})
             $selection=$(if($Details.resumeAll){"默认允许，排除 $($Details.excludedCount) 个"}else{"已选 $($Details.selectedCount) 个聊天"})
             $reset=$(if($Details.autoResetEnabled){"开启，周剩余 ≤$($Details.resetWeeklyRemainingPercent)% 触发"}else{'关闭'})
-            return "设置已应用：每 $($Details.pollSeconds) 秒查询，五小时剩余 ≤$($Details.pauseRemainingPercent)% 暂停；$operation；自动继续：$selection；自动重置卡：$reset。"
+            $retry=$(if($MaxConsecutiveFailures -gt 0){"连续失败 $MaxConsecutiveFailures 次停止监控"}else{'失败持续重试，不自动停止'})
+            return "设置已应用：每 $($Details.pollSeconds) 秒查询，五小时剩余 ≤$($Details.pauseRemainingPercent)% 暂停；$operation；自动继续：$selection；自动重置卡：$reset；$retry。"
         }
         'reset-requested' {return "周额度剩余 $($Details.weeklyRemaining)%，已登记使用一张重置卡，正在等待服务器结果。"}
         'reset-result' {return $(switch($Details.outcome){'reset'{'服务器确认已使用一张重置卡，正在重新查询实际额度。'}'alreadyRedeemed'{'同一重置请求此前已成功，正在重新查询实际额度。'}'nothingToReset'{'服务器当前没有可重置的额度，本次未使用卡；额度耗尽或窗口变化后再检查。'}'noCredit'{'服务器返回没有可用重置卡。'}default{'重置卡结果未知，保留同一请求编号核实。'}})}
@@ -202,7 +212,10 @@ function Get-ChineseEvent($Name,$Details) {
             if($Details.paused){$message+=" 当前有 $($Details.paused) 个聊天保持暂停；额度可用后还会检查账号、周额度和任务状态。"}
             return $message
         }
-        {$_ -in @('all-read-error','connection-or-read-error')} { return "读取额度或聊天状态失败，连续失败 $($Details.failures) 次（上限 5 次）。$(Get-ChineseReason $Details.error)" }
+        {$_ -in @('all-read-error','connection-or-read-error')} {
+            $policy=$(if($Details.error -match 'identity mismatch|Unsupported|Invalid simulated|Real quota is insufficient|requires explicit'){'任务身份或通信校验未通过，将停止自动处理'}elseif(Test-FailureLimitReached $Details.failures){"达到设定的 $MaxConsecutiveFailures 次，将停止监控"}elseif($MaxConsecutiveFailures -gt 0){"达到 $MaxConsecutiveFailures 次才停止监控；将重试"}else{'已关闭自动停止；将持续重试'})
+            return "查询连续失败 $($Details.failures) 次；$policy。$(Get-ChineseReason $Details.error)"
+        }
         'thread-control-error' { return "$label 的操作暂未确认。$(Get-ChineseReason $Details.error)" }
         'owner-unavailable' { return '有一个聊天暂时无法由当前客户端处理，已跳过本次查询。' }
         'removed-chat' { return '一个已登记聊天已归档或移除，取消它的旧任务自动恢复。' }
@@ -752,7 +765,7 @@ function Start-AllMonitor {
                     $record.recoverySeenAt=$null
                     $record.controlFailures=1+[int]$record.controlFailures
                     Write-Event 'thread-control-error' @{error=$_.Exception.Message}
-                    if($record.controlFailures -ge 5){$record.phase='needs_attention';Save-Journal}
+                    if(Test-FailureLimitReached $record.controlFailures){$record.phase='needs_attention';Save-Journal}
                     if(!$script:Pipe -or !$script:Pipe.IsConnected){throw}
                 } finally {
                     if($fileLock){$fileLock.Dispose()};if($owned){$mutex.ReleaseMutex()};$mutex.Dispose()
@@ -770,6 +783,7 @@ function Start-AllMonitor {
                 if($record){$chat.waitReason=Get-RecoveryWaitReason $record $snapshots[$chat.id] $quota}
             }
             $fleet.lastCheckedAt=[DateTimeOffset]::UtcNow.ToString('o')
+            $fleet.readFailureCount=0
             $fleet.lastQuota=$quota;$fleet.lastLiveQuota=$live
             $fleet.settings=Get-MonitorPolicy
             $fleet.counts=@{catalog=$catalog.total;desktopCatalog=$catalog.ids.Count;loaded=$snapshots.Count;active=$activeCount;ordinaryActive=$ordinaryActiveCount;goals=$goalCount;goalSkipped=0;otherMonitor=$busyCount;paused=@($fleet.threads.Values|Where-Object phase -eq 'paused').Count;needsAttention=@($fleet.threads.Values|Where-Object phase -eq 'needs_attention').Count}
@@ -781,11 +795,12 @@ function Start-AllMonitor {
         } catch {
             $script:RunDirectory=$rootDirectory;$script:Journal=$fleet;$script:ThreadId='all';$script:OwnerId=$null
             $failures++;Write-Event 'all-read-error' @{error=$_.Exception.Message;failures=$failures}
+            $fleet.readFailureCount=$failures;$fleet.lastReadErrorAt=[DateTimeOffset]::UtcNow.ToString('o');$fleet.nextPollSeconds=$PollSeconds
             Close-Ipc;Stop-QuotaServer
             foreach($record in $fleet.threads.Values){$record.recoverySeenAt=$null}
             Save-Journal
-            if($_.Exception.Message -match 'identity mismatch|Unsupported|Invalid simulated|Real quota is insufficient|requires explicit' -or $failures -ge 5){Set-Phase 'needs_attention' @{reason=$_.Exception.Message};break}
-            $delay=5
+            if($_.Exception.Message -match 'identity mismatch|Unsupported|Invalid simulated|Real quota is insufficient|requires explicit' -or (Test-FailureLimitReached $failures)){Set-Phase 'needs_attention' @{reason=$_.Exception.Message};break}
+            $delay=$PollSeconds
         }
         if(!(Wait-Poll $delay)){break}
     }
@@ -925,9 +940,8 @@ function Start-Monitor {
             Write-Event 'connection-or-read-error' @{error=$_.Exception.Message;failures=$failures}
             Close-Ipc; Stop-QuotaServer
             $script:Journal.recoverySeenAt=$null; Save-Journal
-            # ponytail: bounded reconnect for one local thread; multi-host operation is outside v1.
-            if ($_.Exception.Message -match 'identity mismatch|Unsupported|Invalid simulated|Real quota is insufficient' -or $failures -ge 5) { Set-Phase 'needs_attention' @{reason=$_.Exception.Message}; break }
-            $delay=5
+            if ($_.Exception.Message -match 'identity mismatch|Unsupported|Invalid simulated|Real quota is insufficient' -or (Test-FailureLimitReached $failures)) { Set-Phase 'needs_attention' @{reason=$_.Exception.Message}; break }
+            $delay=$PollSeconds
         }
         if (!(Wait-Poll $delay)) { break }
     }

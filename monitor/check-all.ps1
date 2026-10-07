@@ -88,4 +88,32 @@ $keepRunning=& $script:ActualWaitPoll 1
 $cancelled=Read-Json (Join-Path $script:TestRoot 'state.json')
 if($keepRunning -or $cancelled.phase -ne 'cancelled' -or @($cancelled.threads.Values|Where-Object phase -ne 'cancelled').Count){throw 'Global cancellation failed to clear saved pause eligibility.'}
 Write-Host 'PASS cancellation clears paused records during poll wait'
+# Exercise actual fleet error handling, without client connections or task controls.
+function Get-LiveQuota {
+    $script:ReadStep++
+    if($script:ReadPlan[$script:ReadStep-1] -eq 'fail'){throw 'temporary read timeout'}
+    return @{accountId=$AccountId;remaining=50;weeklyRemaining=50;allowed=$true;simulated=$true}
+}
+function Get-DesktopCatalog {return @{total=0;ids=@();chats=@()}}
+function Get-DesktopOwners {return @{}}
+function Get-DesktopSnapshots {return @{}}
+function Wait-Poll($seconds){
+    if($seconds -ne 180){throw 'Read retries must use configured normal interval'}
+    return $script:ReadStep -lt $script:ReadPlan.Count
+}
+function Check-ReadRetry($limit,$plan,$expectedSteps,$expectedFailures,$expectedPhase) {
+    $script:RunDirectory=Join-Path $script:TestRoot ([guid]::NewGuid().ToString());[void][IO.Directory]::CreateDirectory($script:RunDirectory)
+    $script:SettingsPath=Join-Path $script:RunDirectory 'settings.json'
+    Write-JsonAtomic $script:SettingsPath @{pollSeconds=180;pauseRemainingPercent=5;maxConsecutiveFailures=$limit}
+    $script:ReadPlan=$plan;$script:ReadStep=0
+    Start-AllMonitor
+    $result=Read-Json (Join-Path $script:RunDirectory 'state.json')
+    if($script:ReadStep -ne $expectedSteps -or $result.readFailureCount -ne $expectedFailures -or $result.phase -ne $expectedPhase){throw "Incorrect fleet retry handling for failure limit $limit"}
+}
+Check-ReadRetry 0 @('fail','fail','fail','fail','fail','fail','ok') 7 0 'observing'
+Write-Host 'PASS six consecutive failures do not stop by default and a successful read clears the counter'
+Check-ReadRetry 3 @('fail','fail','fail','fail','fail') 3 3 'needs_attention'
+Write-Host 'PASS configured threshold stops fleet monitoring after exactly three failed reads'
+Check-ReadRetry 2 @('fail','ok','fail','fail','ok') 4 2 'needs_attention'
+Write-Host 'PASS a successful query resets the consecutive failure threshold before later errors'
 Write-Host 'All-chat coordination checks passed (mocked client and quota; no real chats controlled).'
